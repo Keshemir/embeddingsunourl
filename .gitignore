@@ -1,0 +1,33 @@
+# env / secrets
+.env
+.env.local
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# data / artifacts
+data/audio/
+data/index/
+data/cache/
+*.npy
+*.parquet
+
+# logs
+*.log
+
+# os / editor
+.DS_Store
+.ipynb_checkpoints/
+.idea/
+.vscode/
+
+# Claude Code workspace
+.claude/
+
+# unrelated files in this directory (resume / scratch)
+resume_shaimanova.docx
+build_resume.js

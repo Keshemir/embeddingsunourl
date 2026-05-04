@@ -1,0 +1,17 @@
+# Core: audio embedding + classifiers + Suno ingest
+torch>=2.3
+transformers>=4.44
+librosa>=0.10
+soundfile>=0.12
+numpy>=1.26
+pandas>=2.2
+pyarrow>=15
+mutagen>=1.47
+requests>=2.31
+beautifulsoup4>=4.12
+python-dotenv>=1.0
+tqdm>=4.66
+
+# MuQ-MuLan (multimodal music encoder). If install fails on your platform,
+# set AUDIO_MODEL=mert in .env to use MERT instead (audio-only, no zero-shot).
+muq>=0.1.0
