@@ -15,3 +15,8 @@ tqdm>=4.66
 # MuQ-MuLan (multimodal music encoder). If install fails on your platform,
 # set AUDIO_MODEL=mert in .env to use MERT instead (audio-only, no zero-shot).
 muq>=0.1.0
+
+# server / API
+fastapi>=0.110
+uvicorn[standard]>=0.30
+pydantic>=2.0

@@ -1,4 +1,4 @@
-.PHONY: install extract scan search clean help
+.PHONY: install extract scan search serve eval clean help
 
 PY = .venv/bin/python
 
@@ -9,6 +9,8 @@ help:
 	@echo "make extract BATCH=urls.txt — embed all URLs/paths in a file"
 	@echo "make search Q='dark drill arabic'   — text query against the index"
 	@echo "make search T=<track_id>            — find tracks similar to a seed"
+	@echo "make serve           — launch FastAPI lander at http://localhost:8000"
+	@echo "make eval            — run synthetic LOO eval (Recall@K, MRR)"
 	@echo "make clean           — drop venv and data/index/*"
 
 install:
@@ -36,6 +38,12 @@ else
 	@echo "usage: make search Q='dark drill arabic'"
 	@echo "       make search T=<track_id>"
 endif
+
+serve:
+	$(PY) -m uvicorn scripts.serve:app --host 0.0.0.0 --port 8000 --reload
+
+eval:
+	$(PY) -m scripts.eval
 
 clean:
 	rm -rf .venv data/index/*
