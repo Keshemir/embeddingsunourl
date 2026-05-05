@@ -10,11 +10,11 @@ __pycache__/
 venv/
 
 # data / artifacts
+# `data/index/` (audio.npy + tracks.parquet + calibration.json) is allowed
+# in git for now — small, useful for sharing across machines. Migrate to
+# git-lfs or external storage when corpus grows past ~10 MB.
 data/audio/
-data/index/
 data/cache/
-*.npy
-*.parquet
 
 # logs
 *.log

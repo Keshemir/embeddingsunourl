@@ -52,16 +52,32 @@ def _is_useful_prompt(p: str) -> bool:
     return p.strip().lower() not in PLACEHOLDERS and len(p.strip()) >= 5
 
 
-def _ranks(vecs: np.ndarray, prompts: list[str], em: AudioEmbedder) -> np.ndarray:
-    """Returns per-track rank of the true track when querying with its prompt.
-    -1 if the prompt was unusable."""
+def _ranks(vecs: np.ndarray, prompts: list[str], em: AudioEmbedder,
+           group_ids: np.ndarray | None = None) -> np.ndarray:
+    """Returns per-track rank when querying with its own prompt.
+
+    If `group_ids` is provided, members of the same group (e.g. multiple
+    takes of the same Suno prompt) are treated as the same item — rank is
+    the position of the FIRST same-group hit. This is the right metric on
+    AI-generated corpora where the same prompt produces many variants.
+
+    -1 means the prompt was unusable.
+    """
     ranks = np.full(len(vecs), -1, dtype=np.int32)
     for i, p in enumerate(prompts):
         if not _is_useful_prompt(p):
             continue
         q = em.embed_text(p)
         sims = vecs @ q
-        rank = int((sims > sims[i]).sum() + 1)
+        if group_ids is not None:
+            # First same-group hit (excluding self) — but self is allowed if
+            # it's the highest in its group, that's fine.
+            order = np.argsort(-sims)
+            same = group_ids[order] == group_ids[i]
+            same[order.tolist().index(i)] = True  # self counts
+            rank = int(np.argmax(same)) + 1
+        else:
+            rank = int((sims > sims[i]).sum() + 1)
         ranks[i] = rank
     return ranks
 
@@ -105,13 +121,25 @@ def main() -> None:
         print(f"[err] {type(em).__name__} has no text encoder — eval needs MuQ")
         sys.exit(1)
 
+    # Group-aware: tracks with the same title are takes of the same prompt
+    # in Suno. Treat them as one logical item — Recall@K = "did we surface
+    # any track of the right group in the top K".
+    titles = meta["title"].fillna("").tolist()
+    title_to_id = {t: i for i, t in enumerate(sorted(set(titles)))}
+    group_ids = np.array([title_to_id[t] for t in titles])
+    n_groups = len(title_to_id)
+    print(f"  {n_groups} unique title groups across {len(meta)} tracks "
+          f"(avg {len(meta)/n_groups:.1f} takes/group)")
+
     prompts = meta[args.prompt_col].fillna("").tolist()
-    ranks = _ranks(vecs, prompts, em)
-    _report(ranks, f"prompt → track recall (col={args.prompt_col})")
+    ranks = _ranks(vecs, prompts, em, group_ids)
+    _report(ranks, f"prompt → group recall (col={args.prompt_col})")
 
     if "title" in meta.columns and args.prompt_col != "title":
-        ranks_title = _ranks(vecs, meta["title"].fillna("").tolist(), em)
-        _report(ranks_title, "title → track recall")
+        ranks_title = _ranks(vecs, titles, em, group_ids)
+        _report(ranks_title, "title → group recall (group-aware)")
+        ranks_strict = _ranks(vecs, titles, em, None)
+        _report(ranks_strict, "title → exact-track recall (strict, ignore dups)")
 
 
 if __name__ == "__main__":
