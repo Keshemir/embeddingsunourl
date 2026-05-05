@@ -26,32 +26,52 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config import INDEX_DIR, ROOT
 from embed.audio import AudioEmbedder
+from embed.style import StyleEncoder
 from recsys import events, feed
 
 STATIC_DIR = ROOT / "static"
 
 # ----- one-time globals (loaded at startup) ---------------------------------
 _audio: np.ndarray | None = None
+_style: np.ndarray | None = None       # (N, 1024) BGE-M3 embeddings of Suno style text
 _meta: pd.DataFrame | None = None
 _idx: dict[str, int] | None = None
-_embedder: AudioEmbedder | None = None
+_audio_emb: AudioEmbedder | None = None
+_style_emb: StyleEncoder | None = None
 
 
 def _load_index() -> tuple[np.ndarray, pd.DataFrame, dict[str, int]]:
-    global _audio, _meta, _idx
+    global _audio, _style, _meta, _idx
     if _audio is None:
         _audio = np.load(INDEX_DIR / "audio.npy")
         _meta = pd.read_parquet(INDEX_DIR / "tracks.parquet")
         _idx = {t: i for i, t in enumerate(_meta["track_id"].tolist())}
+        # Style embeddings are optional — server still runs without them, just
+        # falling back to the audio path. Built by `python -m scripts.embed_styles`.
+        sp = INDEX_DIR / "style.npy"
+        if sp.exists():
+            _style = np.load(sp)
+            print(f"[serve] style index loaded: {_style.shape}")
+        else:
+            print(f"[serve] style.npy missing — text search will use audio cosine only")
     assert _audio is not None and _meta is not None and _idx is not None
     return _audio, _meta, _idx
 
 
-def _ensure_embedder() -> AudioEmbedder:
-    global _embedder
-    if _embedder is None:
-        _embedder = AudioEmbedder.load()
-    return _embedder
+def _ensure_audio_embedder() -> AudioEmbedder:
+    global _audio_emb
+    if _audio_emb is None:
+        _audio_emb = AudioEmbedder.load()
+    return _audio_emb
+
+
+def _ensure_style_encoder() -> StyleEncoder | None:
+    global _style_emb
+    if _style is None:
+        return None
+    if _style_emb is None:
+        _style_emb = StyleEncoder()
+    return _style_emb
 
 
 def _top_tags_for_row(meta: pd.DataFrame, i: int, n: int = 5) -> list[dict]:
@@ -229,80 +249,57 @@ def _embed_query_ensemble(em: AudioEmbedder, q: str) -> np.ndarray:
     return avg / (np.linalg.norm(avg) + 1e-12)
 
 
-def _style_substring_hits(meta: pd.DataFrame, q: str) -> list[int]:
-    """Boolean substring search over Suno's own style description.
-
-    `style` is the rich text Suno authored at generation time
-    (e.g. "Russian pop-rock track featuring..."), pulled by ingest.suno_url.
-    For unambiguous queries like "trap" or "arabic" this is way more reliable
-    than any zero-shot tag or audio-text cosine — the words came from Suno
-    itself.
-
-    Returns indices where ANY of the query's tokens appears in style as a
-    word-boundary substring (case-insensitive).
-    """
-    style = meta["style"].fillna("").astype(str).str.lower()
-    tokens = [w for w in q.lower().split() if len(w) >= 3]
-    if not tokens:
-        return []
-    # Word-boundary contains. Multiple tokens → OR.
-    import re as _re
-    pat = "|".join(rf"\b{_re.escape(t)}" for t in tokens)
-    mask = style.str.contains(pat, regex=True, na=False)
-    return [int(i) for i in meta.index[mask]]
-
-
 @app.get("/api/search")
-def api_search(q: str, k: int = 10, ensemble: bool = True) -> dict:
-    """Two-stage hybrid search:
-       1. Boolean substring match in Suno's `style` text (the source of truth).
-       2. Audio-text cosine in MuQ-MuLan space (catches cases where the user
-          phrased it differently from what Suno wrote).
-       Stage-1 hits are surfaced first, then stage-2 fills the rest, with
-       near-duplicate collapse on top.
+def api_search(q: str, k: int = 10) -> dict:
+    """Semantic text-text search over Suno style descriptions.
+
+    Primary signal is BGE-M3 (multilingual semantic encoder) cosine
+    between the query and each track's style embedding (style.npy).
+    A query "arabian" matches tracks described with "oud", "ney flute",
+    "oriental percussion" etc. without literal substring overlap.
+    Russian queries ("арабский", "минор") work the same way — BGE-M3
+    is multilingual.
+
+    Audio cosine is kept only as a fallback when style.npy isn't built
+    yet (legacy MuQ-MuLan text path; less accurate on a one-author
+    Suno corpus).
+
+    Near-duplicate Suno takes (audio cos >= 0.92) are collapsed.
     """
     if not q.strip():
         raise HTTPException(400, "empty query")
     audio, meta, _ = _load_index()
-    em = _ensure_embedder()
-    if not em.supports_text:
-        raise HTTPException(500, "audio model has no text encoder")
 
-    # Stage 1: substring hits in Suno style text (sorted by audio sim within)
-    qv = _embed_query_ensemble(em, q) if ensemble else em.embed_text(q)
-    sims = (audio @ qv).astype(np.float32)
-    style_hits = _style_substring_hits(meta, q)
-    style_hits.sort(key=lambda i: -sims[i])
-
-    # Stage 2: cosine pool excluding what's already in stage 1
-    seen = set(style_hits)
-    cosine_pool = [int(j) for j in np.argsort(-sims) if int(j) not in seen][: max(k * 5, 50)]
-
-    # Dedup near-identical takes
-    def _take(idx_list, limit):
-        kept = []
-        for j in idx_list:
-            if all(float(audio[j] @ audio[k_]) < 0.92 for k_ in kept):
-                kept.append(j)
-            if len(kept) >= limit:
-                break
-        return kept
-
-    style_kept = _take(style_hits, k)
-    if len(style_kept) < k:
-        cosine_kept = _take(cosine_pool, k - len(style_kept))
-        ordered = style_kept + cosine_kept
+    style_enc = _ensure_style_encoder()
+    if style_enc is not None and _style is not None:
+        # Primary path: text-text semantic search via BGE-M3
+        qv = style_enc.encode(q)                # (1024,) L2-normalized
+        sims = (_style @ qv).astype(np.float32)
+        match_kind = "style"
     else:
-        ordered = style_kept
+        # Fallback: MuQ-MuLan audio-text cosine (legacy)
+        em = _ensure_audio_embedder()
+        if not em.supports_text:
+            raise HTTPException(500, "no style.npy and audio model has no text encoder — run scripts.embed_styles first")
+        qv = _embed_query_ensemble(em, q)
+        sims = (audio @ qv).astype(np.float32)
+        match_kind = "audio"
+
+    pool = [int(j) for j in np.argsort(-sims)[: max(k * 5, 50)]]
+    kept: list[int] = []
+    for j in pool:
+        # dedup using audio cosine (Suno emits many takes of the same prompt)
+        if all(float(audio[j] @ audio[k_]) < 0.92 for k_ in kept):
+            kept.append(j)
+        if len(kept) >= k:
+            break
 
     return {
         "query": q,
-        "ensemble": ensemble,
-        "n_style_hits": len(style_hits),
+        "match_kind": match_kind,
         "tracks": [
-            {**_track_card(meta, j), "sim": float(sims[j]),
-             "match": "style" if j in seen else "audio"}
-            for j in ordered[:k]
+            {**_track_card(meta, j), "sim": float(sims[j]), "match": match_kind}
+            for j in kept[:k]
         ],
     }
 
