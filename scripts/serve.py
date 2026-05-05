@@ -12,6 +12,7 @@ from __future__ import annotations
 import sys
 import time
 from pathlib import Path
+import json
 from typing import Any
 
 import numpy as np
@@ -75,17 +76,29 @@ def _ensure_style_encoder() -> StyleEncoder | None:
 
 
 def _top_tags_for_row(meta: pd.DataFrame, i: int, n: int = 5) -> list[dict]:
-    """Return the top-N tags for a track using **z-score** (hubness-corrected).
+    """Tags shown on the track card.
 
-    Why not sigmoid: many tag text-vectors live in dense regions of the joint
-    space and rack up sigmoid ≈ 0.99 across the entire corpus (e.g.
-    `tag::instrument::duduk` had mean 0.986, std 0.011 — useless for ranking).
-    Z-score subtracts the corpus mean and divides by std per tag, so the
-    surfaced tags are the ones where THIS track is actually unusual.
-
-    Falls back to sigmoid if no z::* columns exist (single-track index).
+    Priority:
+      1. **Suno's own parsed tags** (from `suno_tags_flat` JSON column —
+         genre/instrument/mood phrases that Suno itself wrote in the style
+         description). These are ground truth.
+      2. **Z-score zero-shot tags** (from z::* columns) as fallback when
+         Suno tags are missing. Hubness-corrected.
+      3. Sigmoid (tag::*) — last resort, raw cosines.
     """
     row = meta.iloc[i]
+    # 1. Suno parsed tags
+    if "suno_tags_flat" in meta.columns:
+        raw = row.get("suno_tags_flat")
+        if isinstance(raw, str) and raw.strip():
+            try:
+                tags = json.loads(raw)
+                if tags:
+                    return [{**t, "metric": "suno"} for t in tags[:n]]
+            except json.JSONDecodeError:
+                pass
+
+    # 2. Z-score fallback
     z_cols = [c for c in meta.columns if c.startswith("z::")]
     if z_cols:
         cols, prefix = z_cols, "z::"
@@ -95,7 +108,7 @@ def _top_tags_for_row(meta: pd.DataFrame, i: int, n: int = 5) -> list[dict]:
         return []
     scores = [(c, float(row[c])) for c in cols if not np.isnan(row[c])]
     scores.sort(key=lambda x: -x[1])
-    out = []
+    out: list[dict] = []
     for col, val in scores[:n]:
         parts = col.split("::", 2)
         if len(parts) != 3:
@@ -103,28 +116,42 @@ def _top_tags_for_row(meta: pd.DataFrame, i: int, n: int = 5) -> list[dict]:
         out.append({
             "group": parts[1],
             "tag": parts[2].replace("_", " "),
-            "score": round(val, 3),  # z-score (~ ±2 = significant)
+            "score": round(val, 3),
             "metric": "z" if prefix == "z::" else "sigmoid",
         })
     return out
 
 
 def _best_per_group_zscored(meta: pd.DataFrame, i: int) -> dict[str, str]:
-    """Recompute best::group via argmax over z-score columns.
+    """Best label per group, prioritizing Suno's own parsed tags.
 
-    The original best::* in parquet was argmax of softmax — fine for tags that
-    aren't biased by hubness, but for groups where one tag dominates (e.g.
-    "instrumental track without vocals" is high for everything) it lies.
-    Falling back per-group: if a z::group::* column exists, take argmax over
-    those; otherwise keep whatever sits in best::group.
+    Order:
+      1. First entry in `suno_tags` group list (e.g. parsed["genre"][0]).
+         These are the words Suno itself wrote, so they're ground truth.
+      2. Argmax over z-score columns for groups not covered by Suno tags.
+      3. Legacy best::* string columns as ultimate fallback.
     """
     out: dict[str, str] = {}
     row = meta.iloc[i]
+
+    # 1. Suno parsed tags
+    if "suno_tags" in meta.columns:
+        raw = row.get("suno_tags")
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+                for g, tags in parsed.items():
+                    if tags:
+                        out[g] = str(tags[0]).lower()
+            except json.JSONDecodeError:
+                pass
+
+    # 2. Z-score argmax for groups not covered
     z_cols = [c for c in meta.columns if c.startswith("z::")]
     by_group: dict[str, list[str]] = {}
     for c in z_cols:
         parts = c.split("::", 2)
-        if len(parts) == 3:
+        if len(parts) == 3 and parts[1] not in out:
             by_group.setdefault(parts[1], []).append(c)
     for g, cols in by_group.items():
         vals = [(c, float(row[c])) for c in cols if not np.isnan(row[c])]
@@ -132,8 +159,8 @@ def _best_per_group_zscored(meta: pd.DataFrame, i: int) -> dict[str, str]:
             continue
         col, _ = max(vals, key=lambda x: x[1])
         out[g] = col.split("::", 2)[2].replace("_", " ")
-    # Fallback: legacy best::* columns for groups not covered (e.g. fusion if it
-    # wasn't z-scored, or single-track index where calibration didn't run).
+
+    # 3. Legacy best::* fallback
     for col in meta.columns:
         if col.startswith("best::"):
             g = col.split("::", 1)[1]
