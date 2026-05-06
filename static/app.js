@@ -70,10 +70,17 @@ function renderCards(cards, { source = "feed", showSim = false, seedId = null } 
     if (reaction) cls.push(reaction);
     const card = document.createElement("div");
     card.className = cls.join(" ");
-    const tags = [t.best_genre, t.best_mood, t.best_instrument]
-      .filter(Boolean)
-      .map((x) => `<span class="tag">${escape(x)}</span>`)
-      .join("");
+    // Show top-5 tags by sigmoid score, not just best::genre — that's how
+    // fusion-genre signal surfaces (a track's best::genre might be
+    // "russian pop" while its top fusion tag is "arabian junky drill").
+    const tagSpans = (t.top_tags && t.top_tags.length)
+      ? t.top_tags.map((tg) =>
+          `<span class="tag" title="${tg.group} · ${tg.score}">${escape(tg.tag)}</span>`
+        ).join("")
+      : [t.best_genre, t.best_mood, t.best_instrument]
+          .filter(Boolean)
+          .map((x) => `<span class="tag">${escape(x)}</span>`).join("");
+    const tags = tagSpans;
     const meta = [
       t.duration_sec ? `${Math.round(t.duration_sec)}s` : null,
       t.bpm ? `${Math.round(t.bpm)} bpm` : null,
@@ -207,6 +214,58 @@ $("q").addEventListener("keydown", (ev) => {
 });
 
 $("reload-btn").addEventListener("click", refresh);
+
+// --------- Ingest ---------
+
+$("ingest-btn").addEventListener("click", () => {
+  const panel = $("ingest-panel");
+  panel.style.display = panel.style.display === "none" ? "" : "none";
+  if (panel.style.display !== "none") $("ingest-url").focus();
+});
+$("ingest-cancel").addEventListener("click", () => {
+  $("ingest-panel").style.display = "none";
+  $("ingest-url").value = "";
+});
+$("ingest-url").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter") $("ingest-go").click();
+  if (ev.key === "Escape") $("ingest-cancel").click();
+});
+$("ingest-go").addEventListener("click", async () => {
+  const url = $("ingest-url").value.trim();
+  if (!url) return;
+  setStatus(`добавляю трек ${url} ... (~10-30 сек)`);
+  $("ingest-go").disabled = true;
+  try {
+    const r = await fetch("/api/ingest", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url, keep_audio: false }),
+    });
+    if (!r.ok) {
+      const err = await r.text();
+      setStatus(`ошибка: ${err}`);
+      return;
+    }
+    const data = await r.json();
+    if (data.status === "already_indexed") {
+      setStatus(`этот трек уже в индексе (row ${data.row})`);
+    } else {
+      const tags = (data.suno_tags || []).map(t => t.tag).join(" / ");
+      setStatus(`✓ добавлен: ${data.title}  [${tags}]`);
+      // Refresh stats + active tab
+      const t = await api(`/api/tracks?limit=1`);
+      $("stats").textContent = `${t.total} tracks · user: ${USER_ID}`;
+    }
+    $("ingest-url").value = "";
+    $("ingest-panel").style.display = "none";
+    refresh();
+  } catch (e) {
+    setStatus(`ошибка: ${e.message}`);
+  } finally {
+    $("ingest-go").disabled = false;
+  }
+});
+
 
 $("profile-btn").addEventListener("click", async () => {
   const block = $("profile-block");

@@ -28,6 +28,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from config import INDEX_DIR, ROOT
 from embed.audio import AudioEmbedder
 from embed.style import StyleEncoder
+from features import audio_features
+from features.suno_tags import parse as parse_suno_tags, flat_tags as flat_suno_tags
+from ingest.suno import load_track
+from ingest.suno_url import resolve as resolve_suno_url
 from recsys import events, feed
 
 STATIC_DIR = ROOT / "static"
@@ -371,6 +375,137 @@ def api_event(ev: EventIn) -> dict:
 def api_profile(user_id: str) -> dict:
     audio, meta, _ = _load_index()
     return feed.profile_summary(user_id, audio, meta)
+
+
+# ---------------- single-track ingest ---------------------------------------
+
+class IngestIn(BaseModel):
+    url: str
+    keep_audio: bool = False
+
+
+def _append_track(track: dict, audio_vec: np.ndarray, style_vec: np.ndarray) -> int:
+    """Append one track row + 2 vectors to the on-disk index, return its row index."""
+    global _audio, _style, _meta, _idx
+    audio_path = INDEX_DIR / "audio.npy"
+    style_path = INDEX_DIR / "style.npy"
+    tracks_path = INDEX_DIR / "tracks.parquet"
+
+    audio_existing = np.load(audio_path)
+    style_existing = np.load(style_path) if style_path.exists() else None
+    df = pd.read_parquet(tracks_path)
+
+    # Make the new row schema-compatible (fill missing columns with NA)
+    new_row = {c: track.get(c, None) for c in df.columns}
+    for k, v in track.items():
+        if k not in new_row:
+            new_row[k] = v
+    df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+
+    audio_new = np.concatenate([audio_existing, audio_vec[None, :]], axis=0).astype(np.float32)
+    np.save(audio_path, audio_new)
+    if style_existing is not None:
+        style_new = np.concatenate([style_existing, style_vec[None, :]], axis=0).astype(np.float32)
+        np.save(style_path, style_new)
+    df.to_parquet(tracks_path, index=False)
+
+    # Invalidate the in-memory cache so next request re-loads
+    _audio = None
+    _style = None
+    _meta = None
+    _idx = None
+    return len(df) - 1
+
+
+@app.post("/api/ingest")
+def api_ingest(req: IngestIn) -> dict:
+    """Add a Suno share URL to the index in real time.
+
+    Pipeline (~10-30 sec depending on download speed):
+        URL → fetch share-page → mp3 download → MuQ audio embed
+            → BGE-M3 style embed (on Suno style description)
+            → librosa numerical features → Suno tag parse
+            → append to audio.npy + style.npy + tracks.parquet
+    """
+    if not req.url.startswith(("http://", "https://")):
+        raise HTTPException(400, "expected http(s) URL")
+    audio_arr, meta, idx_map = _load_index()
+
+    # 1. fetch share page + download mp3
+    try:
+        mp3_path, sm = resolve_suno_url(req.url)
+    except Exception as e:
+        raise HTTPException(400, f"could not resolve URL: {e}")
+
+    # 2. de-dup: if this Suno UUID is already in the index, return it
+    if sm.suno_id and sm.suno_id in idx_map:
+        if not req.keep_audio:
+            mp3_path.unlink(missing_ok=True)
+            mp3_path.with_suffix(".json").unlink(missing_ok=True)
+        return {"track_id": sm.suno_id, "status": "already_indexed",
+                "row": idx_map[sm.suno_id]}
+
+    # 3. enrich Track from local mp3 + Suno meta
+    track = load_track(mp3_path)
+    if sm.suno_id: track.track_id = sm.suno_id
+    if sm.title:   track.title = sm.title
+    if sm.prompt:  track.prompt = sm.prompt
+    if sm.tags:    track.style = sm.tags
+    if sm.lyrics:  track.lyrics = sm.lyrics
+
+    # 4. embed audio
+    aud_em = _ensure_audio_embedder()
+    audio_vec = aud_em.embed_audio(str(mp3_path))
+
+    # 5. embed style text via BGE-M3
+    style_text = (track.style or track.title or "music").strip()
+    if track.title and track.title not in style_text:
+        style_text = style_text + "\n\n" + track.title
+    sty_em = StyleEncoder() if _style_emb is None else _style_emb
+    style_vec = sty_em.encode(style_text)
+
+    # 6. librosa numerical features
+    try:
+        feats = audio_features.extract(str(mp3_path))
+    except Exception:
+        feats = {}
+
+    # 7. parse Suno tags
+    parsed = parse_suno_tags(track.style or "")
+    flat = flat_suno_tags(parsed)
+
+    row: dict = {
+        "track_id": track.track_id,
+        "source": req.url,
+        "path": str(mp3_path) if req.keep_audio else "",
+        "title": track.title,
+        "prompt": track.prompt,
+        "style": track.style,
+        "lyrics": track.lyrics,
+        "bpm_meta": track.bpm,
+        "key_meta": track.key,
+        "suno_tags": json.dumps(parsed, ensure_ascii=False),
+        "suno_tags_flat": json.dumps(flat, ensure_ascii=False),
+    }
+    row.update(feats)
+
+    # 8. append to indices
+    new_idx = _append_track(row, audio_vec, style_vec)
+
+    # 9. clean up downloaded mp3 unless asked to keep
+    if not req.keep_audio:
+        Path(mp3_path).unlink(missing_ok=True)
+        Path(mp3_path).with_suffix(".json").unlink(missing_ok=True)
+
+    return {
+        "track_id": track.track_id,
+        "row": new_idx,
+        "status": "ingested",
+        "title": track.title,
+        "suno_tags": flat,
+        "audio_dim": int(audio_vec.shape[0]),
+        "style_dim": int(style_vec.shape[0]),
+    }
 
 
 if __name__ == "__main__":

@@ -101,8 +101,15 @@
     <button class="tab" data-tab="similar">Похожие на seed</button>
     <button class="tab" data-tab="search">Поиск</button>
     <div style="flex:1"></div>
+    <button id="ingest-btn" title="добавить Suno-ссылку в индекс">+ Добавить трек</button>
     <button id="profile-btn" title="мой taste vector">Профиль</button>
     <button id="reload-btn" title="перезагрузить ленту">↻ обновить</button>
+  </div>
+  <div id="ingest-panel" class="row" style="margin-top: 10px; display: none;">
+    <input id="ingest-url" type="text" placeholder="https://suno.com/song/<id> или /s/<short>"
+           style="flex: 1; min-width: 400px;">
+    <button class="primary" id="ingest-go">Добавить</button>
+    <button id="ingest-cancel">Отмена</button>
   </div>
 </header>
 
