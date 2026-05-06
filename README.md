@@ -269,12 +269,14 @@ a runtime error). Check stdout for `[warn]` lines from `extract.py`.
 
 ## What's NOT in here yet
 
-- `index/store.py` and `recsys/recommend.py` are stubs for the next
-  stage (vector index + Rocchio + MMR rec). They don't run from the CLI
-  yet — pipeline above is feature extraction only.
-- No web UI. Inspect via pandas / your notebook of choice.
-- No event logging. Add it before you start collecting user
-  interactions, otherwise you'll have nothing to learn on later.
+- No proper auth. Per-browser cookie via `/api/me` is enough for the
+  prototype; replace with OAuth / signed JWT for a real product.
+- No audio streaming. The web UI launches Suno share pages in a new
+  tab to play; if you want inline playback, save the CDN URL during
+  ingest and serve `<audio>` from it.
+- No production deploy. Single `uvicorn` worker on M2; for real
+  traffic, scale out behind a reverse proxy and migrate the indices
+  from `numpy + parquet` to LanceDB / Qdrant.
 
 ## License
 

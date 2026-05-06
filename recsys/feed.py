@@ -26,10 +26,10 @@ WEIGHTS = {
     "save":     +0.8,
     "share":    +0.5,
     "complete": +0.5,
-    "play":     +0.1,    # only if completion_pct >= 0.30
-    "skip":     -0.3,    # only if completion_pct <  0.30
+    "play":     +0.1,    # baseline; bumped to +0.5 if completion_pct >= 0.30
+    "skip":     -0.3,    # only if completion_pct < 0.30 explicitly
     "dislike":  -1.0,
-    "unlike":    0.0,    # informational; cancels nothing automatically
+    "unlike":   -1.0,    # subtract the prior like; see _resolve_unlikes()
 }
 
 DEFAULT_HALF_LIFE_DAYS = 30.0
@@ -60,6 +60,21 @@ def taste_vector(
 ) -> np.ndarray | None:
     """Returns a unit vector, or None if there's no usable history."""
     df = events.load(user_id)
+    return _taste_vector_from_events(df, audio, meta,
+                                      half_life_days=half_life_days, now=now)
+
+
+def _taste_vector_from_events(
+    df: pd.DataFrame,
+    audio: np.ndarray,
+    meta: pd.DataFrame,
+    *,
+    half_life_days: float = DEFAULT_HALF_LIFE_DAYS,
+    now: float | None = None,
+) -> np.ndarray | None:
+    """Same Rocchio computation but takes the events DataFrame directly,
+    so callers like profile_summary can read the log once and reuse it.
+    """
     if df.empty:
         return None
     now = now if now is not None else time.time()
@@ -122,12 +137,23 @@ def cold_start(
     audio: np.ndarray,
     meta: pd.DataFrame,
     k: int = 20,
-    rng_seed: int | None = 0,
+    rng_seed: int | None = None,
+    user_id: str | None = None,
 ) -> list[int]:
     """Diverse-by-best::genre starter pool.
 
     Pick one random track from each unique best::genre bucket, then fill the
-    rest from the largest buckets. Cheap, deterministic with rng_seed."""
+    rest from the largest buckets.
+
+    Stability: if `user_id` is provided, we hash it into a deterministic seed
+    so the same user always sees the same cold-start order across reloads
+    (until they have likes). Different users see different starts. If neither
+    `rng_seed` nor `user_id` is set, the order is fresh on every call.
+    """
+    if rng_seed is None and user_id:
+        # Stable per-user but distinct across users.
+        import hashlib as _h
+        rng_seed = int(_h.sha1(user_id.encode("utf-8")).hexdigest()[:8], 16)
     rng = np.random.default_rng(rng_seed)
     if "best::genre" not in meta.columns:
         return list(rng.choice(len(meta), size=min(k, len(meta)), replace=False))
@@ -173,7 +199,7 @@ def recommend_for_user(
     q = taste_vector(user_id, audio, meta)
     if q is None:
         debug["mode"] = "cold_start"
-        return cold_start(audio, meta, k=k), debug
+        return cold_start(audio, meta, k=k, user_id=user_id), debug
 
     debug["mode"] = "personalized"
     sims = (audio @ q).astype(np.float32)
@@ -190,21 +216,15 @@ def recommend_for_user(
 
     pool_idx = [int(i) for i in np.argsort(-sims)[:pool] if sims[i] != -np.inf]
     if not pool_idx:
-        return cold_start(audio, meta, k=k), {**debug, "mode": "cold_start_fallback"}
+        return cold_start(audio, meta, k=k, user_id=user_id), {**debug, "mode": "cold_start_fallback"}
 
-    # Dedup
-    kept: list[int] = []
-    for i in pool_idx:
-        if all(float(audio[i] @ audio[k]) < dedup_threshold for k in kept):
-            kept.append(i)
-        if len(kept) >= max(k * 3, 30):
-            break
-    pool_idx = kept
-
-    # MMR rerank
+    # MMR rerank first — its diversity penalty already discourages picking
+    # near-clones. Then a final dedup pass collapses the remaining
+    # near-identical Suno takes that slipped through MMR's diversity term.
     selected: list[int] = []
     remaining = list(pool_idx)
-    while len(selected) < k and remaining:
+    target = k + 5  # over-pick a bit so dedup has slack
+    while len(selected) < target and remaining:
         if not selected:
             i = max(remaining, key=lambda c: sims[c])
         else:
@@ -215,7 +235,17 @@ def recommend_for_user(
             i = max(remaining, key=score)
         selected.append(i)
         remaining.remove(i)
-    return selected, debug
+
+    # Final dedup against actual waveform duplicates (multiple Suno takes
+    # of the same prompt have audio cosine ≥ 0.92 even if MMR ranked them
+    # apart on relevance).
+    final: list[int] = []
+    for i in selected:
+        if all(float(audio[i] @ audio[k_]) < dedup_threshold for k_ in final):
+            final.append(i)
+        if len(final) >= k:
+            break
+    return final, debug
 
 
 def profile_summary(
@@ -224,17 +254,21 @@ def profile_summary(
     meta: pd.DataFrame,
     top_n: int = 5,
 ) -> dict:
-    """Top genres/moods/instruments aligned with the taste vector — for /api/profile."""
-    q = taste_vector(user_id, audio, meta)
+    """Top genres/moods/instruments aligned with the taste vector.
+
+    One read of events.parquet (was three: one inside taste_vector +
+    two for n_events).
+    """
+    df = events.load(user_id)
+    n_events = int(len(df))
+    q = _taste_vector_from_events(df, audio, meta)
     if q is None:
-        return {"taste": None, "n_events": int(len(events.load(user_id)))}
-    summary: dict = {"taste": "personalized", "n_events": int(len(events.load(user_id)))}
-    # For each best::group column, find the most-aligned group label by
-    # measuring the mean cosine of taste vec with tracks in that bucket.
+        return {"taste": None, "n_events": n_events}
+    summary: dict = {"taste": "personalized", "n_events": n_events}
+    sims_to_q = audio @ q  # compute once, reuse across groups
     for col in ("best::genre", "best::mood", "best::instrument"):
         if col not in meta.columns:
             continue
-        sims_to_q = audio @ q
         means = (
             meta.assign(_s=sims_to_q)
             .groupby(col)["_s"]

@@ -287,8 +287,13 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 def api_tracks(limit: int = 200, offset: int = 0) -> dict:
     audio, meta, _ = _load_index()
     end = min(offset + limit, len(meta))
+    has_more = end < len(meta)
     return {
         "total": int(len(meta)),
+        "offset": int(offset),
+        "limit": int(limit),
+        "has_more": has_more,
+        "next_offset": int(end) if has_more else None,
         "tracks": [_track_card(meta, i) for i in range(offset, end)],
     }
 
