@@ -25,20 +25,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config import INDEX_DIR
-from embed.style import StyleEncoder
-
-PLACEHOLDERS = {
-    "",
-    "listen and make your own on suno.",
-    "listen and make your own on suno",
-}
-
-
-def _useful(t: str) -> str:
-    """Pick the best text for embedding: prefer style (rich Suno description),
-    fall back to prompt or title for tracks where style is empty.
-    """
-    return t or ""
+from embed.style import StyleEncoder, build_style_text
 
 
 def main() -> None:
@@ -52,16 +39,16 @@ def main() -> None:
     df = pd.read_parquet(idx / "tracks.parquet")
     print(f"loaded {len(df)} tracks from {idx}")
 
-    # Build the text input for each track. Combine style + title so a track
-    # whose Suno description is sparse still has something to encode.
+    # Build the text input for each track via the shared helper — same logic
+    # as live `/api/ingest` to guarantee identical embeddings for the same input.
     parts = []
     for _, r in df.iterrows():
-        style = str(r.get("style") or "").strip()
-        title = str(r.get("title") or "").strip()
-        if style.lower() in PLACEHOLDERS:
-            style = ""
-        text = (style + "\n\n" + title).strip() if title else style
-        parts.append(text or title or "music")
+        parts.append(build_style_text(
+            style=r.get("style"),
+            title=r.get("title"),
+            prompt=r.get("prompt"),
+            lyrics=r.get("lyrics"),
+        ))
     print(f"  text length: median={int(np.median([len(p) for p in parts]))}, "
           f"max={max(len(p) for p in parts)}")
 

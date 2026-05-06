@@ -13,6 +13,8 @@ import sys
 import time
 from pathlib import Path
 import json
+import os
+import threading
 from typing import Any
 
 import numpy as np
@@ -27,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config import INDEX_DIR, ROOT
 from embed.audio import AudioEmbedder
-from embed.style import StyleEncoder
+from embed.style import StyleEncoder, build_style_text
 from features import audio_features
 from features.suno_tags import parse as parse_suno_tags, flat_tags as flat_suno_tags
 from ingest.suno import load_track
@@ -45,21 +47,35 @@ _audio_emb: AudioEmbedder | None = None
 _style_emb: StyleEncoder | None = None
 
 
+_INDEX_LOCK = threading.RLock()  # serialize load + append (M6)
+
+
 def _load_index() -> tuple[np.ndarray, pd.DataFrame, dict[str, int]]:
     global _audio, _style, _meta, _idx
-    if _audio is None:
-        _audio = np.load(INDEX_DIR / "audio.npy")
-        _meta = pd.read_parquet(INDEX_DIR / "tracks.parquet")
-        _idx = {t: i for i, t in enumerate(_meta["track_id"].tolist())}
-        # Style embeddings are optional — server still runs without them, just
-        # falling back to the audio path. Built by `python -m scripts.embed_styles`.
-        sp = INDEX_DIR / "style.npy"
-        if sp.exists():
-            _style = np.load(sp)
-            print(f"[serve] style index loaded: {_style.shape}")
-        else:
-            print(f"[serve] style.npy missing — text search will use audio cosine only")
-    assert _audio is not None and _meta is not None and _idx is not None
+    with _INDEX_LOCK:
+        if _audio is None:
+            _audio = np.load(INDEX_DIR / "audio.npy")
+            _meta = pd.read_parquet(INDEX_DIR / "tracks.parquet")
+            _idx = {t: i for i, t in enumerate(_meta["track_id"].tolist())}
+            sp = INDEX_DIR / "style.npy"
+            if sp.exists():
+                _style = np.load(sp)
+                print(f"[serve] style index loaded: {_style.shape}")
+            else:
+                print(f"[serve] style.npy missing — text search will use audio cosine only")
+        # Hard consistency check — ingest was supposed to keep these in sync.
+        # If any step failed mid-write, surface it loudly instead of returning
+        # mismatched arrays that silently mis-pair tracks at search time.
+        n = len(_meta)
+        assert _audio.shape[0] == n, (
+            f"index mismatch: audio.npy has {_audio.shape[0]} rows, "
+            f"tracks.parquet has {n}. Last ingest likely failed mid-write."
+        )
+        if _style is not None:
+            assert _style.shape[0] == n, (
+                f"index mismatch: style.npy has {_style.shape[0]} rows, "
+                f"tracks.parquet has {n}. Run scripts.embed_styles to rebuild."
+            )
     return _audio, _meta, _idx
 
 
@@ -384,37 +400,98 @@ class IngestIn(BaseModel):
     keep_audio: bool = False
 
 
-def _append_track(track: dict, audio_vec: np.ndarray, style_vec: np.ndarray) -> int:
-    """Append one track row + 2 vectors to the on-disk index, return its row index."""
+def _atomic_replace(target: Path, write_fn) -> None:
+    """Write to target via a sibling .new tempfile, then os.replace().
+
+    `os.replace` is atomic on POSIX — either the new file is in place or the
+    old one is. If write_fn raises mid-flight, the .new tempfile is removed
+    and the original is untouched.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + ".new")
+    try:
+        write_fn(tmp)
+        os.replace(tmp, target)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
+
+def _append_track(track: dict, audio_vec: np.ndarray,
+                   style_vec: np.ndarray | None) -> int:
+    """Append one track row + 2 vectors to the on-disk index atomically.
+
+    Strategy: write all three files to .new siblings first, then os.replace
+    each (or roll back all .new tempfiles on any error). The cache is
+    invalidated only after all three succeed, so concurrent reads either see
+    the old consistent state or the new consistent state — never a mix.
+
+    Returns the new row index on success.
+    """
     global _audio, _style, _meta, _idx
     audio_path = INDEX_DIR / "audio.npy"
     style_path = INDEX_DIR / "style.npy"
     tracks_path = INDEX_DIR / "tracks.parquet"
 
-    audio_existing = np.load(audio_path)
-    style_existing = np.load(style_path) if style_path.exists() else None
-    df = pd.read_parquet(tracks_path)
+    with _INDEX_LOCK:
+        audio_existing = np.load(audio_path)
+        style_existing = np.load(style_path) if style_path.exists() else None
+        df = pd.read_parquet(tracks_path)
 
-    # Make the new row schema-compatible (fill missing columns with NA)
-    new_row = {c: track.get(c, None) for c in df.columns}
-    for k, v in track.items():
-        if k not in new_row:
-            new_row[k] = v
-    df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+        # Sanity: existing files must agree before we extend them.
+        n_old = len(df)
+        if audio_existing.shape[0] != n_old:
+            raise RuntimeError(
+                f"refusing to append: audio.npy ({audio_existing.shape[0]}) "
+                f"already mismatches parquet ({n_old}). Fix the index first."
+            )
+        if style_existing is not None and style_existing.shape[0] != n_old:
+            raise RuntimeError(
+                f"refusing to append: style.npy ({style_existing.shape[0]}) "
+                f"already mismatches parquet ({n_old}). Fix the index first."
+            )
 
-    audio_new = np.concatenate([audio_existing, audio_vec[None, :]], axis=0).astype(np.float32)
-    np.save(audio_path, audio_new)
-    if style_existing is not None:
-        style_new = np.concatenate([style_existing, style_vec[None, :]], axis=0).astype(np.float32)
-        np.save(style_path, style_new)
-    df.to_parquet(tracks_path, index=False)
+        # Build the new row schema-compatibly (fill missing columns with None)
+        new_row = {c: track.get(c, None) for c in df.columns}
+        for k, v in track.items():
+            if k not in new_row:
+                new_row[k] = v
+        df_new = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
 
-    # Invalidate the in-memory cache so next request re-loads
-    _audio = None
-    _style = None
-    _meta = None
-    _idx = None
-    return len(df) - 1
+        audio_new = np.concatenate(
+            [audio_existing, audio_vec[None, :]], axis=0
+        ).astype(np.float32)
+
+        # H3: always create style.npy on first ingest, even if missing on disk.
+        if style_existing is None:
+            style_combined = style_vec[None, :].astype(np.float32) if style_vec is not None else None
+        elif style_vec is not None:
+            style_combined = np.concatenate(
+                [style_existing, style_vec[None, :]], axis=0
+            ).astype(np.float32)
+        else:
+            # Existing file but no new vector — pad with zeros to keep shape sync
+            zero = np.zeros((1, style_existing.shape[1]), dtype=np.float32)
+            style_combined = np.concatenate([style_existing, zero], axis=0).astype(np.float32)
+
+        # All three writes go to .new tempfiles first, then we replace atomically.
+        # If any individual replace fails, prior replaces stay (we treat replace
+        # as the commit point) — but the temp-file write step is rolled back.
+        _atomic_replace(audio_path, lambda p: np.save(p, audio_new))
+        if style_combined is not None:
+            _atomic_replace(style_path, lambda p: np.save(p, style_combined))
+        _atomic_replace(tracks_path, lambda p: df_new.to_parquet(p, index=False))
+
+        # Invalidate cache so next read picks up new files (under the same lock)
+        _audio = None
+        _style = None
+        _meta = None
+        _idx = None
+
+        return n_old
 
 
 @app.post("/api/ingest")
@@ -457,10 +534,13 @@ def api_ingest(req: IngestIn) -> dict:
     aud_em = _ensure_audio_embedder()
     audio_vec = aud_em.embed_audio(str(mp3_path))
 
-    # 5. embed style text via BGE-M3
-    style_text = (track.style or track.title or "music").strip()
-    if track.title and track.title not in style_text:
-        style_text = style_text + "\n\n" + track.title
+    # 5. embed style text via BGE-M3 — exact same text construction as
+    # scripts/embed_styles.py (build_style_text) so a track ingested live
+    # gets the same vector as if it were extracted in bulk.
+    style_text = build_style_text(
+        style=track.style, title=track.title,
+        prompt=track.prompt, lyrics=track.lyrics,
+    )
     sty_em = StyleEncoder() if _style_emb is None else _style_emb
     style_vec = sty_em.encode(style_text)
 

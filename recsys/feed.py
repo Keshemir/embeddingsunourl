@@ -73,17 +73,26 @@ def taste_vector(
         action = e["action"]
         if action not in WEIGHTS:
             continue
-        # Filter ambiguous plays — only count plays that actually played
+        # play/skip require thoughtful completion-pct handling — see C4 in audit.
+        # Default `play` weight is +0.1; if the player reported >=30% completion
+        # we upgrade it to "complete-ish" weight (+0.5). Missing completion_pct
+        # is OK for play (browser tab unfocused, etc.) — keep the small +0.1 signal.
+        # For skip, we only count it as a *negative* signal when completion_pct
+        # is explicitly < 0.30; without that evidence we ignore it (we don't
+        # know if the user skipped early or just listened through).
+        comp = e.get("completion_pct")
+        comp_known = comp is not None and not (isinstance(comp, float) and np.isnan(comp))
+
         if action == "play":
-            comp = e.get("completion_pct")
-            if comp is None or (isinstance(comp, float) and (np.isnan(comp) or comp < 0.30)):
-                continue
-        if action == "skip":
-            comp = e.get("completion_pct")
-            # only count skips that aborted early (otherwise it's just a finish)
-            if comp is None or (isinstance(comp, float) and (np.isnan(comp) or comp >= 0.30)):
-                continue
-        w = WEIGHTS[action] * _decay(float(e["ts"]), now, half_life_days)
+            base = WEIGHTS["complete"] if (comp_known and comp >= 0.30) else WEIGHTS["play"]
+        elif action == "skip":
+            if not comp_known or comp >= 0.30:
+                continue   # not a real abort signal
+            base = WEIGHTS["skip"]
+        else:
+            base = WEIGHTS[action]
+
+        w = base * _decay(float(e["ts"]), now, half_life_days)
         pos_idx = idx.get(e["track_id"])
         if pos_idx is None:
             continue

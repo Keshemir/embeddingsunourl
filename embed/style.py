@@ -64,3 +64,65 @@ class StyleEncoder:
 def get_default_encoder() -> StyleEncoder:
     """Singleton accessor."""
     return StyleEncoder()
+
+
+# ----- text construction (shared by bulk and live ingest) -------------------
+
+# Suno's auto-generated placeholder description on share pages without
+# real metadata. We never want to embed it.
+_PLACEHOLDERS = frozenset({
+    "",
+    "listen and make your own on suno.",
+    "listen and make your own on suno",
+})
+
+
+def build_style_text(*, style: str | None, title: str | None,
+                      prompt: str | None = None,
+                      lyrics: str | None = None) -> str:
+    """Canonical text input for style embedding.
+
+    One source of truth used by both bulk extract (`scripts/embed_styles.py`)
+    and live ingest (`/api/ingest`). Without this, the same track can land
+    different style embeddings depending on its ingestion path — breaking
+    cosine consistency in search.
+
+    Composition (in order, deduped, joined by blank line):
+      1. user prompt (intent — strongest signal when we control generation)
+      2. Suno style description (rich auto-tags from the model)
+      3. lyrics
+      4. title
+
+    Each part is included only if non-empty and not a known placeholder.
+    Title is appended last and only if not already a substring of the text
+    we have so far (avoids "лалалал\\n\\nлалалал" duplication).
+    Final fallback when everything is empty: the title alone, or "music".
+    """
+    def clean(s: str | None) -> str:
+        if not s:
+            return ""
+        v = s.strip()
+        if v.lower() in _PLACEHOLDERS:
+            return ""
+        return v
+
+    prompt_c = clean(prompt)
+    style_c = clean(style)
+    lyrics_c = clean(lyrics)
+    title_c = clean(title)
+
+    parts: list[str] = []
+    if prompt_c:
+        parts.append(prompt_c)
+    if style_c:
+        parts.append(style_c)
+    if lyrics_c:
+        parts.append(lyrics_c)
+
+    text = "\n\n".join(parts)
+
+    # Append title only if it adds information.
+    if title_c and (not text or title_c.lower() not in text.lower()):
+        text = (text + "\n\n" + title_c) if text else title_c
+
+    return text or title_c or "music"
