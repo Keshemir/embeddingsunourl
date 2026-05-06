@@ -4,7 +4,10 @@
 // All (just the corpus), Similar (top-k near a seed track), Search (text).
 // Every action posts to /api/event so the taste vector evolves.
 
-const USER_ID = "alrakhymzhan";
+// USER_ID is bound to the httponly cookie set by GET /api/me. The cookie
+// itself isn't readable from JS, so we ask the server who we are. Until
+// the call returns we use a placeholder; api() calls happen after init().
+let USER_ID = "anon";
 const SESSION_ID = (() => {
   let s = sessionStorage.getItem("session_id");
   if (!s) {
@@ -283,6 +286,8 @@ $("profile-btn").addEventListener("click", async () => {
 
 (async () => {
   try {
+    const me = await api(`/api/me`);
+    USER_ID = me.user_id;
     const data = await api(`/api/tracks?limit=1`);
     $("stats").textContent = `${data.total} tracks · user: ${USER_ID}`;
   } catch (e) {

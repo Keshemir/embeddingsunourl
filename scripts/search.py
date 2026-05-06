@@ -1,15 +1,20 @@
-"""Search the index — 2-stage retrieve + re-rank.
+"""Search the index — same pipeline as the HTTP /api/search endpoint.
 
-Stage 1: cosine retrieve (semantic ranking on the audio embedding).
-Stage 2:
-   - boolean tag filters (--no-vocals, --min-tag);
-   - de-duplication of near-identical tracks (Suno often emits multiple
-     takes of the same prompt that pollute top-k);
-   - MMR re-ranking for diversity;
-   - hard cutoff against the corpus's pairwise-cosine percentile, so a
-     no-match query returns "nothing" instead of random.
+Stage 1 — semantic retrieval:
+   * For --text queries we embed via BGE-M3 (multilingual) and cosine
+     against `style.npy` (Suno description embeddings). This is the
+     ground-truth text↔text path. If style.npy is absent, we fall back
+     to MuQ-MuLan audio↔text — but you should rebuild the style index
+     (`python -m scripts.embed_styles`) instead.
+   * For --track queries we cosine the seed track's `audio.npy` row
+     against the rest of the corpus (audio↔audio).
 
-The score is never bent by filters — filter is yes/no, rank is cosine.
+Stage 2 — boolean tag filters (--no-vocals, --min-tag, --min-z),
+near-duplicate dedup, MMR diversity rerank, optional hard cutoff
+against the corpus's pairwise-cosine percentile so a no-match query
+returns "nothing" instead of random.
+
+Score is never bent by filters — filter is yes/no, rank is cosine.
 
 Examples:
     python -m scripts.search --text "chill late-night drive"
@@ -32,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config import INDEX_DIR
 from embed.audio import AudioEmbedder
+from embed.style import StyleEncoder
 
 DEDUP_THRESHOLD = 0.92      # cosine >= this → near-duplicates (collapse)
 DEFAULT_MMR_LAMBDA = 0.65   # 1.0 = pure relevance, 0.0 = pure diversity
@@ -112,23 +118,39 @@ def main() -> None:
         ap.error("provide --text or --track")
 
     idx = Path(args.index_dir)
-    vecs = np.load(idx / "audio.npy")
+    audio = np.load(idx / "audio.npy")
+    style_path = idx / "style.npy"
+    style = np.load(style_path) if style_path.exists() else None
     meta = pd.read_parquet(idx / "tracks.parquet")
-    print(f"loaded {len(meta)} tracks, dim={vecs.shape[1]}")
+    print(f"loaded {len(meta)} tracks  audio_dim={audio.shape[1]}"
+          + (f" style_dim={style.shape[1]}" if style is not None else "  style.npy=missing"))
 
     # ---- Stage 1: semantic ranking ----
+    # text query → BGE-M3 cosine on style.npy (same as HTTP /api/search)
+    # seed track → audio cosine on audio.npy (track-to-track similarity)
     if args.text:
-        em = AudioEmbedder.load()
-        if not em.supports_text:
-            print(f"[warn] {type(em).__name__} can't embed text — use --track instead")
-            return
-        q = em.embed_text(args.text)
+        if style is not None:
+            enc = StyleEncoder()
+            q = enc.encode(args.text)
+            vecs = style
+            print(f"[search] text mode → BGE-M3 vs style.npy ({style.shape[1]}-d)")
+        else:
+            em = AudioEmbedder.load()
+            if not em.supports_text:
+                print(f"[warn] {type(em).__name__} can't embed text and style.npy is missing — "
+                      f"run `python -m scripts.embed_styles`")
+                return
+            q = em.embed_text(args.text)
+            vecs = audio
+            print(f"[search] text mode → MuQ-MuLan fallback (no style.npy). "
+                  f"Run scripts.embed_styles for better results.")
     else:
         pos = meta.index[meta["track_id"] == args.track]
         if len(pos) == 0:
             print(f"track_id {args.track!r} not found")
             return
-        q = vecs[int(pos[0])]
+        q = audio[int(pos[0])]
+        vecs = audio  # seed→audio cosine
 
     sims = (vecs @ q).astype(np.float32)
     if args.track:
@@ -184,10 +206,16 @@ def main() -> None:
 
     # ---- Stage 2c: dedup ----
     if not args.no_dedup:
-        kept, clusters = _dedup(pool_idx, vecs, args.dedup_threshold)
+        # Pick a sensible threshold for the space we ranked in. BGE-M3 cosines
+        # run higher than MuQ audio cosines, so we use 0.97 for text↔text and
+        # 0.92 for audio↔audio unless the user overrode it.
+        threshold = args.dedup_threshold
+        if threshold == DEDUP_THRESHOLD and vecs is style:
+            threshold = 0.97
+        kept, clusters = _dedup(pool_idx, vecs, threshold)
         n_dropped = sum(len(c) for c in clusters)
         if n_dropped:
-            print(f"[dedup] collapsed {n_dropped} near-duplicates (cos>={args.dedup_threshold})")
+            print(f"[dedup] collapsed {n_dropped} near-duplicates (cos>={threshold})")
         pool_idx = kept
 
     # ---- Stage 2d: MMR rerank for diversity ----

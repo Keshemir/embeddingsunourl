@@ -14,12 +14,13 @@ import time
 from pathlib import Path
 import json
 import os
+import secrets
 import threading
 from typing import Any
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import Cookie, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -31,7 +32,9 @@ from config import INDEX_DIR, ROOT
 from embed.audio import AudioEmbedder
 from embed.style import StyleEncoder, build_style_text
 from features import audio_features
+from features import calibrate as cal_mod
 from features.suno_tags import parse as parse_suno_tags, flat_tags as flat_suno_tags
+from features import zeroshot
 from ingest.suno import load_track
 from ingest.suno_url import resolve as resolve_suno_url
 from recsys import events, feed
@@ -233,9 +236,47 @@ def _startup() -> None:
     print(f"[serve] loaded {len(_meta)} tracks, dim={_audio.shape[1]}")
 
 
+UID_COOKIE = "ozenref_uid"
+COOKIE_TTL = 365 * 24 * 3600
+
+
+def _ensure_uid_cookie(request: Request, response: Response) -> str:
+    """Return the request's user id, minting one and setting the cookie if
+    absent. We're not authenticating against a real account — this is just
+    a stable per-browser identifier so the recsys can keep separate taste
+    vectors. Replace with proper auth (OAuth, signed JWT) for production."""
+    uid = request.cookies.get(UID_COOKIE)
+    if not uid or len(uid) < 8:
+        uid = "u_" + secrets.token_urlsafe(12)
+        response.set_cookie(
+            UID_COOKIE, uid,
+            max_age=COOKIE_TTL, httponly=True, samesite="lax",
+        )
+    return uid
+
+
 @app.get("/")
-def root() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
+def root(request: Request, response: Response) -> FileResponse:
+    _ensure_uid_cookie(request, response)
+    fr = FileResponse(STATIC_DIR / "index.html")
+    # Mirror the cookie into the FileResponse — Starlette ignores set_cookie
+    # on `response` since we return a different object.
+    if UID_COOKIE not in request.cookies:
+        fr.set_cookie(
+            UID_COOKIE,
+            request.cookies.get(UID_COOKIE) or response.headers.get("set-cookie", "").split("=", 1)[-1].split(";", 1)[0]
+            or "u_" + secrets.token_urlsafe(12),
+            max_age=COOKIE_TTL, httponly=True, samesite="lax",
+        )
+    return fr
+
+
+@app.get("/api/me")
+def api_me(request: Request, response: Response) -> dict:
+    """Return the caller's user id, minting one if absent. Frontend calls
+    this on load to learn its uid (httponly cookie isn't readable from JS)."""
+    uid = _ensure_uid_cookie(request, response)
+    return {"user_id": uid}
 
 
 # Mount static AFTER /, so / hits the route, not the file
@@ -322,22 +363,36 @@ def api_search(q: str, k: int = 10) -> dict:
         # Primary path: text-text semantic search via BGE-M3
         qv = style_enc.encode(q)                # (1024,) L2-normalized
         sims = (_style @ qv).astype(np.float32)
+        # Dedup in the same space we ranked in: two tracks the search
+        # engine considers "the same hit" must also be near each other in
+        # the embedding it judged on. Suno also emits many takes of the
+        # same prompt, so we additionally check audio similarity as a
+        # belt-and-braces filter against pure waveform duplicates.
+        dedup_mat = _style
+        text_threshold = 0.97   # BGE-M3 cosines run high — be strict
+        audio_threshold = 0.92  # audio dups (same prompt, multiple takes)
         match_kind = "style"
     else:
-        # Fallback: MuQ-MuLan audio-text cosine (legacy)
         em = _ensure_audio_embedder()
         if not em.supports_text:
             raise HTTPException(500, "no style.npy and audio model has no text encoder — run scripts.embed_styles first")
         qv = _embed_query_ensemble(em, q)
         sims = (audio @ qv).astype(np.float32)
+        dedup_mat = audio
+        text_threshold = 0.92
+        audio_threshold = 0.92  # same matrix; only one threshold applies
         match_kind = "audio"
 
     pool = [int(j) for j in np.argsort(-sims)[: max(k * 5, 50)]]
     kept: list[int] = []
     for j in pool:
-        # dedup using audio cosine (Suno emits many takes of the same prompt)
-        if all(float(audio[j] @ audio[k_]) < 0.92 for k_ in kept):
-            kept.append(j)
+        # 1) ranking-space dedup (text↔text or audio↔audio)
+        if any(float(dedup_mat[j] @ dedup_mat[k_]) >= text_threshold for k_ in kept):
+            continue
+        # 2) belt-and-braces audio-waveform dedup (Suno multi-take)
+        if any(float(audio[j] @ audio[k_]) >= audio_threshold for k_ in kept):
+            continue
+        kept.append(j)
         if len(kept) >= k:
             break
 
@@ -373,7 +428,13 @@ class EventIn(BaseModel):
 
 
 @app.post("/api/event")
-def api_event(ev: EventIn) -> dict:
+def api_event(ev: EventIn, request: Request, response: Response) -> dict:
+    """Log an interaction. user_id in the body must match the caller's
+    cookie — prevents one client from polluting another's taste vector by
+    spoofing user_id in the request body."""
+    cookie_uid = _ensure_uid_cookie(request, response)
+    if ev.user_id != cookie_uid:
+        raise HTTPException(403, "user_id does not match session cookie")
     if ev.action not in events.VALID_ACTIONS:
         raise HTTPException(400, f"unknown action {ev.action!r}")
     _, meta, idx = _load_index()
@@ -398,6 +459,53 @@ def api_profile(user_id: str) -> dict:
 class IngestIn(BaseModel):
     url: str
     keep_audio: bool = False
+
+
+def _recalibrate_zscores() -> None:
+    """Recompute per-tag z-score across the current corpus and write z::*
+    columns back into tracks.parquet.
+
+    Called after each /api/ingest so newcomers don't show NaN z-scores in
+    the UI and so mean/std reflect the latest corpus state. Sub-second on
+    200-1000 tracks. Atomically rewrites tracks.parquet via .new tempfile.
+    """
+    global _audio, _style, _meta, _idx
+    tracks_path = INDEX_DIR / "tracks.parquet"
+    cal_path = INDEX_DIR / "calibration.json"
+    with _INDEX_LOCK:
+        df = pd.read_parquet(tracks_path)
+        raw_cols = sorted(c for c in df.columns if c.startswith("raw::"))
+        if not raw_cols:
+            return
+        raw_mat = df[raw_cols].to_numpy(dtype=np.float32)
+        # Skip rows that are all-NaN (e.g. older tracks ingested before zero-shot)
+        valid = ~np.all(np.isnan(raw_mat), axis=1)
+        if valid.sum() < 2:
+            return
+        cal = cal_mod.fit(np.nan_to_num(raw_mat[valid], nan=0.0))
+        z = cal.zscore(np.nan_to_num(raw_mat, nan=0.0))
+        z_cols = [c.replace("raw::", "z::", 1) for c in raw_cols]
+        for i, c in enumerate(z_cols):
+            df[c] = z[:, i]
+        # Atomic write
+        _atomic_replace(tracks_path, lambda p: df.to_parquet(p, index=False))
+        # Update calibration.json snapshot for analytics tools (not used at request-time)
+        try:
+            audio_arr = _audio if _audio is not None else np.load(INDEX_DIR / "audio.npy")
+            hist = cal_mod.cosine_histogram(audio_arr)
+        except Exception:
+            hist = {}
+        cal_path.write_text(json.dumps({
+            "n_tracks": int(len(df)),
+            "n_tags": int(len(raw_cols)),
+            "tag_means": cal.mean.tolist(),
+            "tag_stds": cal.std.tolist(),
+            "tag_columns": raw_cols,
+            "pairwise_cosine": hist,
+        }, indent=2))
+        # Bust meta cache so next /api/tracks reads the updated z::*
+        _meta = None
+        _idx = None
 
 
 def _atomic_replace(target: Path, write_fn) -> None:
@@ -550,9 +658,30 @@ def api_ingest(req: IngestIn) -> dict:
     except Exception:
         feats = {}
 
-    # 7. parse Suno tags
+    # 7. parse Suno tags (parser handles literal \n)
     parsed = parse_suno_tags(track.style or "")
     flat = flat_suno_tags(parsed)
+
+    # 8. zero-shot tags via MuQ-MuLan — same pipeline as scripts/extract.py.
+    # Without this, freshly ingested tracks have empty tag::*/raw::*/z::*
+    # columns and their UI cards fall back to suno_tags only. With it,
+    # all tracks share the same scoring grid.
+    raw_per_tag: dict[str, float] = {}
+    sigmoid_per_tag: dict[str, float] = {}
+    if aud_em.supports_text:
+        try:
+            zs = zeroshot.score(audio_vec, aud_em)
+            flat_pairs = zs["flat"]                  # [(group, tag), ...]
+            raw_cos = zs["raw_cos"]                  # (T,) signed cosines
+            for (g, tag), val in zip(flat_pairs, raw_cos.tolist()):
+                key_safe = f"{g}::{tag.replace(' ', '_').replace('-', '_')}"
+                raw_per_tag[f"raw::{key_safe}"] = float(val)
+            for g, m in zs["sigmoid"].items():
+                for tag, val in m.items():
+                    key_safe = f"{g}::{tag.replace(' ', '_').replace('-', '_')}"
+                    sigmoid_per_tag[f"tag::{key_safe}"] = float(val)
+        except Exception as e:
+            print(f"[ingest] zero-shot scoring failed: {e}")
 
     row: dict = {
         "track_id": track.track_id,
@@ -568,9 +697,19 @@ def api_ingest(req: IngestIn) -> dict:
         "suno_tags_flat": json.dumps(flat, ensure_ascii=False),
     }
     row.update(feats)
+    row.update(raw_per_tag)
+    row.update(sigmoid_per_tag)
 
-    # 8. append to indices
+    # 9. append to indices (atomic — see _append_track)
     new_idx = _append_track(row, audio_vec, style_vec)
+
+    # 10. recompute z-score per tag across the (now N+1) corpus + write back.
+    # Hubness depends on what's in the corpus, so each new track shifts the
+    # mean/std slightly. For 200-1000 tracks this is a sub-second op.
+    try:
+        _recalibrate_zscores()
+    except Exception as e:
+        print(f"[ingest] z-score recalibration failed: {e}")
 
     # 9. clean up downloaded mp3 unless asked to keep
     if not req.keep_audio:
