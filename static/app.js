@@ -22,12 +22,31 @@ const grid = $("grid");
 const statusEl = $("status");
 
 let state = {
-  tab: "feed",
+  tab: "wave",
   seed: null,           // track_id of the current seed (Similar tab)
   query: "",
   cards: [],            // last rendered cards
   reactions: new Map(), // track_id → "liked" | "disliked" | "saved"
 };
+
+// ---- Wave state ----
+const wave = {
+  mode: "wave",   // "wave" | "mixer"
+  sliders: {drill: 0.5, trap: 0.5, ambient: 0.5, pop: 0.5, rock: 0.5},
+  current: null,    // {track_id, audio_url, ...}
+  queue: [],        // [{track_id, ...}, ...]
+  played: [],       // recent track_ids for `exclude`
+  busyRefetch: false,
+  startTs: 0,       // when current track started — for completion_pct on skip
+};
+
+function debounce(fn, ms) {
+  let t = null;
+  return (...args) => {
+    if (t) clearTimeout(t);
+    t = setTimeout(() => fn(...args), ms);
+  };
+}
 
 // ---------- API ----------
 
@@ -114,7 +133,188 @@ function escape(s) {
   );
 }
 
+// ---------- Wave (radio + mixer) ----------
+
+function renderWave() {
+  // Hide the generic grid, show the wave pane
+  $("grid").style.display = "none";
+  $("wave-pane").style.display = "";
+
+  const player = $("player");
+  if (!wave.current) {
+    player.className = "player-card empty";
+    player.textContent = "загружаем волну...";
+    $("up-next").style.display = "none";
+    return;
+  }
+  const t = wave.current;
+  const tags = (t.top_tags || []).map(x => x.tag).slice(0, 5).join(" · ");
+  player.className = "player-card";
+  player.innerHTML = `
+    <div class="title">${escape(t.title || "(untitled)")}</div>
+    <div class="meta-line">${escape(tags || "—")}  ·  ${Math.round(t.duration_sec || 0)}s · ${escape(t.key || "")} · ${Math.round(t.bpm || 0)} bpm</div>
+    <audio id="audio" controls preload="auto" src="${escape(t.audio_url || "")}" autoplay></audio>
+    <div class="row-actions">
+      <button class="primary" id="btn-next" title="следующий — логирует skip">⏭ Next</button>
+      <button id="btn-like" title="лайк">👍</button>
+      <button id="btn-dislike" title="дизлайк">👎</button>
+      <button id="btn-save" title="сохранить">💾</button>
+    </div>
+  `;
+
+  const audio = $("audio");
+  audio.addEventListener("play", () => { wave.startTs = Date.now(); logEvent(t.track_id, "play", "wave", null); });
+  audio.addEventListener("ended", () => {
+    logEvent(t.track_id, "complete", "wave", 1.0);
+    playNext();
+  });
+  audio.addEventListener("error", () => {
+    // CORS or 404 fallback: switch to /api/audio/{id} which 302's same-origin
+    if (!audio.src.includes("/api/audio/")) {
+      audio.src = `/api/audio/${encodeURIComponent(t.track_id)}`;
+      audio.play().catch(() => {});
+    }
+  });
+
+  $("btn-next").onclick = () => {
+    const pct = audio.duration ? (audio.currentTime / audio.duration) : null;
+    logEvent(t.track_id, "skip", "wave", pct);
+    playNext();
+  };
+  $("btn-like").onclick = () => {
+    state.reactions.set(t.track_id, "liked");
+    logEvent(t.track_id, "like", "wave");
+  };
+  $("btn-dislike").onclick = () => {
+    state.reactions.set(t.track_id, "disliked");
+    logEvent(t.track_id, "dislike", "wave");
+  };
+  $("btn-save").onclick = () => {
+    state.reactions.set(t.track_id, "saved");
+    logEvent(t.track_id, "save", "wave");
+  };
+
+  // up-next list
+  if (wave.queue.length) {
+    $("up-next").style.display = "";
+    $("queue-list").innerHTML = wave.queue.map(q => {
+      const qtags = (q.top_tags || []).map(x => x.tag).slice(0, 3).join(" · ");
+      return `<div class="queue-item"><div class="qt">${escape(q.title)}</div><div class="qg">${escape(qtags)}</div></div>`;
+    }).join("");
+  } else {
+    $("up-next").style.display = "none";
+  }
+}
+
+async function refetchQueue(replace = true) {
+  if (wave.busyRefetch) return;
+  wave.busyRefetch = true;
+  try {
+    const exclude = [
+      ...(wave.current ? [wave.current.track_id] : []),
+      ...wave.queue.map(t => t.track_id),
+      ...wave.played,
+    ];
+    const r = await fetch("/api/wave", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        mode: wave.mode,
+        sliders: wave.sliders,
+        exclude: [...new Set(exclude)],
+        k: 5,
+      }),
+    });
+    if (!r.ok) {
+      const text = await r.text();
+      setStatus(`wave: ошибка ${r.status} ${text}`);
+      return;
+    }
+    const data = await r.json();
+    if (replace) {
+      wave.queue = data.tracks || [];
+    } else {
+      wave.queue.push(...(data.tracks || []));
+    }
+    if (!wave.current && wave.queue.length) {
+      // первый запуск — поднимаем первый трек как current
+      playNext();
+    } else {
+      renderWave();
+    }
+  } catch (e) {
+    setStatus(`wave: ${e.message}`);
+  } finally {
+    wave.busyRefetch = false;
+  }
+}
+
+function playNext() {
+  if (wave.current) wave.played.push(wave.current.track_id);
+  if (wave.played.length > 30) wave.played.shift();
+
+  wave.current = wave.queue.shift() || null;
+  if (!wave.current) {
+    refetchQueue(true);
+    return;
+  }
+  renderWave();
+  // если осталось мало — подгружаем
+  if (wave.queue.length < 3) refetchQueue(false);
+}
+
+// Mixer event wiring (called once at init)
+function wireMixer() {
+  document.querySelectorAll('input[type=range][data-slider]').forEach(el => {
+    const name = el.dataset.slider;
+    const valEl = document.querySelector(`[data-val-for="${name}"]`);
+    el.addEventListener("input", () => {
+      const v = parseFloat(el.value);
+      wave.sliders[name] = v;
+      if (valEl) valEl.textContent = v.toFixed(2);
+      debouncedRefetch();
+    });
+  });
+  $("mode-wave").onclick = () => setMode("wave");
+  $("mode-mixer").onclick = () => setMode("mixer");
+  $("reset-sliders").onclick = () => {
+    document.querySelectorAll('input[type=range][data-slider]').forEach(el => {
+      el.value = "0.5";
+      wave.sliders[el.dataset.slider] = 0.5;
+      const v = document.querySelector(`[data-val-for="${el.dataset.slider}"]`);
+      if (v) v.textContent = "0.50";
+    });
+    refetchQueue(true);
+  };
+}
+
+const debouncedRefetch = debounce(() => refetchQueue(true), 300);
+
+function setMode(m) {
+  wave.mode = m;
+  $("mode-wave").classList.toggle("active", m === "wave");
+  $("mode-mixer").classList.toggle("active", m === "mixer");
+  refetchQueue(true);
+}
+
+function hideWavePane() {
+  $("wave-pane").style.display = "none";
+  $("grid").style.display = "";
+}
+
+
 // ---------- Tab handlers ----------
+
+async function loadWave() {
+  hideWavePane(); $("wave-pane").style.display = "";
+  $("grid").style.display = "none";
+  setStatus("");
+  if (wave.current) {
+    renderWave();
+  } else {
+    refetchQueue(true);
+  }
+}
 
 async function loadFeed() {
   setStatus("грузим персональную ленту...");
@@ -155,10 +355,15 @@ function setStatus(s) { statusEl.textContent = s; }
 
 async function refresh() {
   try {
-    if (state.tab === "feed")    await loadFeed();
-    else if (state.tab === "all")     await loadAll();
+    if (state.tab === "wave") {
+      await loadWave();
+      return;
+    }
+    hideWavePane();   // make sure player is hidden when leaving Wave
+    if (state.tab === "all")          await loadAll();
     else if (state.tab === "similar") await loadSimilar(state.seed);
     else if (state.tab === "search")  await loadSearch(state.query);
+    else if (state.tab === "feed")    await loadFeed();   // legacy
   } catch (e) {
     setStatus(`ошибка: ${e.message}`);
   }
@@ -293,5 +498,6 @@ $("profile-btn").addEventListener("click", async () => {
   } catch (e) {
     $("stats").textContent = "(сервер не отвечает)";
   }
-  setActiveTab("feed");
+  wireMixer();
+  setActiveTab("wave");
 })();

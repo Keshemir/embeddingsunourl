@@ -83,6 +83,76 @@
   details { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; margin-bottom: 10px; }
   details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
   pre { font-size: 11px; overflow-x: auto; color: var(--muted); }
+
+  /* ---- Wave layout ---- */
+  .wave-grid {
+    display: grid;
+    grid-template-columns: 1fr 360px;
+    gap: 16px;
+    align-items: start;
+  }
+  @media (max-width: 900px) {
+    .wave-grid { grid-template-columns: 1fr; }
+  }
+  .player-card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 18px; display: flex; flex-direction: column;
+    gap: 12px;
+  }
+  .player-card.empty { color: var(--muted); text-align: center; padding: 40px; }
+  .player-card .title { font-size: 18px; font-weight: 700; }
+  .player-card audio { width: 100%; margin: 8px 0; }
+  .player-card .row-actions {
+    display: flex; gap: 8px; flex-wrap: wrap;
+  }
+  .player-card .row-actions button {
+    font-size: 14px; padding: 8px 14px; border-radius: 8px;
+  }
+  .player-card .row-actions button.primary { background: var(--accent); color: white; border-color: var(--accent); }
+  .player-card .meta-line { color: var(--muted); font-size: 12px; }
+
+  .mixer-card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 14px; display: flex; flex-direction: column;
+    gap: 10px;
+  }
+  .mixer-card h3 { margin: 0 0 4px 0; font-size: 14px; font-weight: 700; }
+  .mode-toggle { display: flex; gap: 4px; margin-bottom: 4px; }
+  .mode-toggle button {
+    flex: 1; padding: 6px 10px; border-radius: 6px;
+    background: transparent; border: 1px solid var(--border); color: var(--muted);
+    font-size: 12px;
+  }
+  .mode-toggle button.active {
+    background: var(--accent); color: white; border-color: var(--accent);
+  }
+  .slider-row {
+    display: grid;
+    grid-template-columns: 70px 1fr 36px;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+  }
+  .slider-row .name { color: var(--text); font-weight: 600; }
+  .slider-row .val { color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+  .slider-row input[type=range] {
+    width: 100%; accent-color: var(--accent);
+  }
+
+  .queue-card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 12px; margin-top: 12px;
+  }
+  .queue-card h3 { margin: 0 0 8px 0; font-size: 13px; color: var(--muted); font-weight: 600; }
+  .queue-item {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 8px; padding: 6px 4px; border-bottom: 1px solid var(--border);
+    font-size: 13px;
+  }
+  .queue-item:last-child { border-bottom: none; }
+  .queue-item .qt { color: var(--text); }
+  .queue-item .qg { color: var(--muted); font-size: 11px; }
 </style>
 </head>
 <body>
@@ -96,7 +166,7 @@
     <button class="primary" id="search-btn">Найти</button>
   </div>
   <div class="row" style="margin-top: 10px;">
-    <button class="tab active" data-tab="feed">Лента</button>
+    <button class="tab active" data-tab="wave">Волна</button>
     <button class="tab" data-tab="all">Все треки</button>
     <button class="tab" data-tab="similar">Похожие на seed</button>
     <button class="tab" data-tab="search">Поиск</button>
@@ -119,6 +189,54 @@
     <pre id="profile-json"></pre>
   </details>
   <div id="status"></div>
+
+  <!-- Wave tab content (hidden when other tabs active) -->
+  <div id="wave-pane" class="wave-grid" style="display:none">
+    <div>
+      <div id="player" class="player-card empty">плеер запускается...</div>
+      <div id="up-next" class="queue-card" style="display:none">
+        <h3>Дальше в очереди:</h3>
+        <div id="queue-list"></div>
+      </div>
+    </div>
+    <div>
+      <div class="mixer-card">
+        <h3>🎚 Микшер</h3>
+        <div class="mode-toggle">
+          <button id="mode-wave" class="active" title="60% твой вкус + 40% ползунки">Моя волна</button>
+          <button id="mode-mixer" title="100% ползунки, без taste">Микшер</button>
+        </div>
+        <div class="slider-row">
+          <span class="name">Drill</span>
+          <input type="range" min="0" max="1" step="0.05" value="0.5" data-slider="drill">
+          <span class="val" data-val-for="drill">0.50</span>
+        </div>
+        <div class="slider-row">
+          <span class="name">Trap</span>
+          <input type="range" min="0" max="1" step="0.05" value="0.5" data-slider="trap">
+          <span class="val" data-val-for="trap">0.50</span>
+        </div>
+        <div class="slider-row">
+          <span class="name">Ambient</span>
+          <input type="range" min="0" max="1" step="0.05" value="0.5" data-slider="ambient">
+          <span class="val" data-val-for="ambient">0.50</span>
+        </div>
+        <div class="slider-row">
+          <span class="name">Pop</span>
+          <input type="range" min="0" max="1" step="0.05" value="0.5" data-slider="pop">
+          <span class="val" data-val-for="pop">0.50</span>
+        </div>
+        <div class="slider-row">
+          <span class="name">Rock</span>
+          <input type="range" min="0" max="1" step="0.05" value="0.5" data-slider="rock">
+          <span class="val" data-val-for="rock">0.50</span>
+        </div>
+        <button id="reset-sliders" style="margin-top: 4px; font-size: 11px;">сбросить</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Other tabs (всё что не Wave) -->
   <div id="grid" class="grid"></div>
 </main>
 

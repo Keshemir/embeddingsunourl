@@ -37,7 +37,7 @@ from features.suno_tags import parse as parse_suno_tags, flat_tags as flat_suno_
 from features import zeroshot
 from ingest.suno import load_track
 from ingest.suno_url import resolve as resolve_suno_url
-from recsys import events, feed
+from recsys import events, feed, wave
 
 STATIC_DIR = ROOT / "static"
 
@@ -48,6 +48,7 @@ _meta: pd.DataFrame | None = None
 _idx: dict[str, int] | None = None
 _audio_emb: AudioEmbedder | None = None
 _style_emb: StyleEncoder | None = None
+_direction_bank: dict[str, np.ndarray] | None = None  # wave mixer directions
 
 
 _INDEX_LOCK = threading.RLock()  # serialize load + append (M6)
@@ -96,6 +97,20 @@ def _ensure_style_encoder() -> StyleEncoder | None:
     if _style_emb is None:
         _style_emb = StyleEncoder()
     return _style_emb
+
+
+def _ensure_direction_bank() -> dict[str, np.ndarray] | None:
+    """Lazily build the BGE-M3 direction bank for the Wave mixer.
+    Encoder is the same one used by /api/search; bank is built once at first
+    /api/wave call and kept in RAM."""
+    global _direction_bank
+    if _direction_bank is not None:
+        return _direction_bank
+    enc = _ensure_style_encoder()
+    if enc is None:
+        return None
+    _direction_bank = wave._build_direction_bank(enc)
+    return _direction_bank
 
 
 def _top_tags_for_row(meta: pd.DataFrame, i: int, n: int = 5) -> list[dict]:
@@ -206,6 +221,7 @@ def _track_card(meta: pd.DataFrame, i: int) -> dict[str, Any]:
         "track_id": str(s("track_id")),
         "title": str(s("title")) or "(untitled)",
         "source": str(s("source")),
+        "audio_url": str(s("audio_url")),       # direct CDN mp3 — for inline <audio>
         "duration_sec": float(s("duration_sec", 0.0) or 0.0),
         "bpm": float(s("bpm_perceived", 0.0) or 0.0),
         "key": str(s("key")),
@@ -459,6 +475,71 @@ def api_profile(user_id: str) -> dict:
     return feed.profile_summary(user_id, audio, meta)
 
 
+# ---------------- Wave: personal radio with mixer ---------------------------
+
+class WaveIn(BaseModel):
+    mode: str = "wave"   # "wave" (taste + mixer) or "mixer" (only sliders)
+    sliders: dict[str, float] = {}
+    exclude: list[str] = []
+    k: int = 5
+
+
+@app.post("/api/wave")
+def api_wave(req: WaveIn, request: Request, response: Response) -> dict:
+    """Return the next k tracks for the personal radio.
+
+    Two modes:
+      - "wave"  → 0.6 * taste_vector_style(user) + 0.4 * mixer_vec
+      - "mixer" → mixer_vec only (or corpus centroid if all sliders = 0.5)
+
+    The user_id is bound to the cookie so anonymous clients still get a
+    stable identity for taste tracking.
+    """
+    user_id = _ensure_uid_cookie(request, response)
+    audio, meta, _ = _load_index()
+    if _style is None:
+        raise HTTPException(500, "style.npy missing — run scripts.embed_styles first")
+    bank = _ensure_direction_bank()
+    if bank is None:
+        raise HTTPException(500, "could not build direction bank")
+
+    indices, debug = wave.recommend_wave(
+        user_id, req.sliders or {},
+        mode=req.mode if req.mode in ("wave", "mixer") else "wave",
+        exclude=set(req.exclude or []),
+        audio=audio, style=_style, meta=meta,
+        direction_bank=bank, k=req.k,
+    )
+    sims_style = (_style @ wave._l2(_style.mean(axis=0))).astype(np.float32)  # placeholder
+    # Recompute final sims for the response (cheap — the wave path already did it)
+    # but we also want sim per result; pull from debug if exposed, else 0.0.
+    return {
+        "mode": debug.get("mode", req.mode),
+        "debug": debug,
+        "tracks": [_track_card(meta, j) for j in indices],
+    }
+
+
+@app.get("/api/audio/{track_id}")
+def api_audio(track_id: str):
+    """CORS fallback: redirect to the track's CDN URL.
+
+    Inline <audio src="https://cdn1.suno.ai/...mp3"> usually works directly,
+    but if a track's CDN response lacks Access-Control-Allow-Origin, the
+    browser will fail. Frontend then falls back to /api/audio/{id} which is
+    same-origin and 302's the request, sidestepping CORS for media.
+    """
+    from fastapi.responses import RedirectResponse
+    _, meta, idx = _load_index()
+    if track_id not in idx:
+        raise HTTPException(404, f"track_id {track_id!r} not found")
+    row = meta.iloc[idx[track_id]]
+    url = row.get("audio_url", "")
+    if not isinstance(url, str) or not url.startswith("http"):
+        raise HTTPException(404, "no audio_url stored — run scripts.backfill_audio_url")
+    return RedirectResponse(url, status_code=302)
+
+
 # ---------------- single-track ingest ---------------------------------------
 
 class IngestIn(BaseModel):
@@ -691,6 +772,7 @@ def api_ingest(req: IngestIn) -> dict:
     row: dict = {
         "track_id": track.track_id,
         "source": req.url,
+        "audio_url": sm.audio_url or "",  # direct CDN URL for inline playback
         "path": str(mp3_path) if req.keep_audio else "",
         "title": track.title,
         "prompt": track.prompt,

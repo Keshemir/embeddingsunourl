@@ -64,6 +64,28 @@ def taste_vector(
                                       half_life_days=half_life_days, now=now)
 
 
+def taste_vector_style(
+    user_id: str,
+    style_vecs: np.ndarray,
+    meta: pd.DataFrame,
+    *,
+    half_life_days: float = DEFAULT_HALF_LIFE_DAYS,
+    now: float | None = None,
+) -> np.ndarray | None:
+    """Rocchio taste vector but in **style space** (BGE-M3 1024-d).
+
+    Mirror of `taste_vector` (audio space) — same weights, same recency
+    decay, same NaN-safe play/skip handling — just operates on style.npy
+    rows instead of audio.npy rows. Used by the Wave mixer to combine
+    user taste with slider direction in a single embedding space.
+
+    Returns a unit vector or None if the user has no usable history.
+    """
+    df = events.load(user_id)
+    return _taste_vector_from_events(df, style_vecs, meta,
+                                      half_life_days=half_life_days, now=now)
+
+
 def _taste_vector_from_events(
     df: pd.DataFrame,
     audio: np.ndarray,
@@ -74,6 +96,8 @@ def _taste_vector_from_events(
 ) -> np.ndarray | None:
     """Same Rocchio computation but takes the events DataFrame directly,
     so callers like profile_summary can read the log once and reuse it.
+    Works in any embedding space — the `audio` argument can be either
+    audio.npy (default for taste_vector) or style.npy (for taste_vector_style).
     """
     if df.empty:
         return None
